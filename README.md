@@ -44,7 +44,7 @@ cd antigravity-computer-use
 Once installed, invoke the skill in Antigravity chat with:
 
 ```text
-/computer-use Open Sober on this computer.
+/computer-use
 ```
 
 ---
