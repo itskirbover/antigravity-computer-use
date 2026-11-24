@@ -6,6 +6,8 @@ Universal Linux desktop automation and computer-use skill for **Google Antigravi
 
 ## Highlights
 
+- **Non-Focus-Stealing by Default + Separate `focus` Action**
+  Every interaction (`click`, `drag`, `scroll`, `launch`, `open`, and `--window`-targeted `key`/`type`) automatically snapshots and restores the user's active window and cursor position (via KWin 6 Scripting on KDE Plasma, `hyprctl` on Hyprland, `swaymsg` on Sway, or `xdotool` on X11) so background automation doesn't interrupt your work. Focusing a window is an explicit, separate action (`agy-cu focus <query>`). Also includes zero-focus AT-SPI2 commands (`a11y-click`, `a11y-type`) for accessible apps.
 - **Zero-Dependency Kernel `/dev/uinput` Virtual Pointer & Keyboard (`cu.py`)**
   Works natively across all Wayland compositors and X11 without requiring `xdotool` or a running `ydotoold` daemon. Automatically falls back to `xdotool`, `ydotool`, or `wtype` when `/dev/uinput` is unavailable.
 - **Auto-Detecting Screenshot Engine**
@@ -99,11 +101,16 @@ agy-cu key "ctrl+shift+t"
 agy-cu type "Hello world!" --enter
 agy-cu type "Unicode & fast paste 🚀" --paste --enter
 
-# Window list, clipboard, and app launching
+# Window inspection, explicit focusing (separate action), clipboard, and background app launching
 agy-cu windows
+agy-cu active-window
+agy-cu cursor-pos
+agy-cu focus "Dolphin"            # Explicit separate action to focus a window
+agy-cu focus --class "discord"
+agy-cu a11y-click "easyeffects" "Bypass"   # Zero-focus AT-SPI2 background click
 agy-cu clipboard-get
 agy-cu clipboard-set "copied text"
-agy-cu launch "konsole"
+agy-cu launch "konsole"           # Launches with focus guard (does not steal focus)
 agy-cu open "https://github.com"
 ```
 

@@ -24,6 +24,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -572,6 +573,518 @@ class UInputController:
 
 
 # ---------------------------------------------------------------------------
+# Focus Management & Non-Focus-Stealing Preservation (KDE KWin, Hyprland, Sway, X11)
+# ---------------------------------------------------------------------------
+
+def _kwin_run_script(js_template: str, timeout_ms: int = 1500) -> Optional[Dict[str, Any]]:
+    """
+    Execute an ephemeral KWin 6 JavaScript snippet via `org.kde.kwin.Scripting`
+    and receive a JSON payload back via a temporary session D-Bus callback.
+    `js_template` must contain `{BUS_NAME}` where `callDBus` sends its JSON string.
+    """
+    if not shutil.which("qdbus6"):
+        return None
+    try:
+        import gi
+        gi.require_version("Gio", "2.0")
+        gi.require_version("GLib", "2.0")
+        from gi.repository import Gio, GLib
+    except Exception:
+        return None
+
+    result: Dict[str, Any] = {}
+    loop = GLib.MainLoop()
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    except Exception:
+        return None
+    bus_name = bus.get_unique_name()
+
+    xml = """<node>
+      <interface name="org.antigravity.KWinCallback">
+        <method name="Report">
+          <arg type="s" name="payload" direction="in"/>
+        </method>
+      </interface>
+    </node>"""
+    node_info = Gio.DBusNodeInfo.new_for_xml(xml)
+
+    def on_method_call(conn, sender, obj_path, iface, method, params, invocation):
+        if method == "Report":
+            try:
+                result["data"] = json.loads(params.unpack()[0])
+            except Exception as exc:
+                result["data"] = {"ok": False, "error": str(exc)}
+            invocation.return_value(None)
+            loop.quit()
+
+    reg_id = bus.register_object(
+        "/Callback", node_info.interfaces[0], on_method_call, None, None
+    )
+    js_code = js_template.replace("__BUS_NAME__", bus_name)
+    js_path: Optional[str] = None
+    plugin_name = f"agy_cu_{os.getpid()}_{int(time.time() * 1000) % 100000}"
+
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as tf:
+            tf.write(js_code)
+            js_path = tf.name
+
+        res = subprocess.run(
+            ["qdbus6", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.loadScript", js_path, plugin_name],
+            capture_output=True, text=True, timeout=3
+        )
+        script_id = res.stdout.strip()
+        if res.returncode != 0 or not script_id.isdigit():
+            return None
+
+        subprocess.run(
+            ["qdbus6", "org.kde.KWin", f"/Scripting/Script{script_id}", "org.kde.kwin.Script.run"],
+            capture_output=True, text=True, timeout=3
+        )
+        GLib.timeout_add(timeout_ms, loop.quit)
+        loop.run()
+    except Exception:
+        return None
+    finally:
+        subprocess.run(
+            ["qdbus6", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", plugin_name],
+            capture_output=True, text=True, timeout=3
+        )
+        bus.unregister_object(reg_id)
+        if js_path and os.path.exists(js_path):
+            try:
+                os.unlink(js_path)
+            except OSError:
+                pass
+
+    return result.get("data")
+
+
+def kwin_get_state() -> Optional[Dict[str, Any]]:
+    """Return active window, cursor position, and open windows via KWin 6 Scripting."""
+    js = r"""
+var wins = [];
+var list = workspace.windowList();
+var active = workspace.activeWindow;
+for (var i = 0; i < list.length; i++) {
+    var w = list[i];
+    if (w.normalWindow || w.dialog) {
+        wins.push({
+            id: String(w.internalId),
+            title: String(w.caption || ''),
+            class: String(w.resourceClass || ''),
+            pid: Number(w.pid || 0),
+            x: Math.round(w.x),
+            y: Math.round(w.y),
+            width: Math.round(w.width),
+            height: Math.round(w.height),
+            active: (active && String(w.internalId) === String(active.internalId)),
+            minimized: Boolean(w.minimized)
+        });
+    }
+}
+var payload = JSON.stringify({
+    ok: true,
+    cursor: { x: Math.round(workspace.cursorPos.x), y: Math.round(workspace.cursorPos.y) },
+    active_id: active ? String(active.internalId) : null,
+    active_title: active ? String(active.caption || '') : null,
+    active_class: active ? String(active.resourceClass || '') : null,
+    windows: wins
+});
+callDBus('__BUS_NAME__', '/Callback', 'org.antigravity.KWinCallback', 'Report', payload);
+"""
+    return _kwin_run_script(js)
+
+
+def kwin_focus_window(
+    window_id: Optional[str] = None,
+    query: Optional[str] = None,
+    class_name: Optional[str] = None,
+    unminimize: bool = True,
+) -> Dict[str, Any]:
+    """Focus a window on KDE Plasma 6 via KWin Scripting."""
+    id_json = json.dumps(window_id or "")
+    query_json = json.dumps((query or "").lower())
+    class_json = json.dumps((class_name or "").lower())
+    unmin_js = "true" if unminimize else "false"
+
+    js = f"""
+var targetId = {id_json};
+var targetQuery = {query_json};
+var targetClass = {class_json};
+var unminimize = {unmin_js};
+var list = workspace.windowList();
+var found = null;
+for (var i = 0; i < list.length; i++) {{
+    var w = list[i];
+    if (!(w.normalWindow || w.dialog)) continue;
+    var wid = String(w.internalId);
+    var title = String(w.caption || '').toLowerCase();
+    var cls = String(w.resourceClass || '').toLowerCase();
+    if (targetId && wid === targetId) {{
+        found = w;
+        break;
+    }}
+    if (!targetId && targetClass && cls.indexOf(targetClass) !== -1) {{
+        found = w;
+        break;
+    }}
+    if (!targetId && targetQuery && (title.indexOf(targetQuery) !== -1 || cls.indexOf(targetQuery) !== -1)) {{
+        found = w;
+        break;
+    }}
+}}
+var out;
+if (found) {{
+    if (unminimize && found.minimized) {{
+        found.minimized = false;
+    }}
+    workspace.activeWindow = found;
+    out = {{
+        ok: true,
+        backend: 'kwin-script',
+        id: String(found.internalId),
+        title: String(found.caption || ''),
+        class: String(found.resourceClass || '')
+    }};
+}} else {{
+    out = {{ ok: false, backend: 'kwin-script', error: 'No matching window found' }};
+}}
+callDBus('__BUS_NAME__', '/Callback', 'org.antigravity.KWinCallback', 'Report', JSON.stringify(out));
+"""
+    res = _kwin_run_script(js)
+    if res is None:
+        return {"ok": False, "error": "KWin scripting unavailable"}
+    return res
+
+
+def get_focus_snapshot() -> Dict[str, Any]:
+    """Capture the user's currently focused window, cursor position, and open window IDs."""
+    env = detect_environment()
+    compositor = env["compositor"]
+    tools = env["available_tools"]
+
+    # 1. KDE Plasma 6 (KWin Scripting)
+    if compositor == "kde-kwin" and env["runtime_dir_accessible"]:
+        state = kwin_get_state()
+        if state and state.get("ok"):
+            return {
+                "ok": True,
+                "backend": "kwin-script",
+                "active_id": state.get("active_id"),
+                "active_title": state.get("active_title"),
+                "active_class": state.get("active_class"),
+                "cursor": state.get("cursor"),
+                "window_ids": [w["id"] for w in state.get("windows", [])],
+            }
+
+    # 2. Hyprland
+    if compositor == "hyprland" and "hyprctl" in tools:
+        try:
+            aw = json.loads(subprocess.run(["hyprctl", "activewindow", "-j"], capture_output=True, text=True, timeout=2).stdout or "{}")
+            cp = json.loads(subprocess.run(["hyprctl", "cursorpos", "-j"], capture_output=True, text=True, timeout=2).stdout or "{}")
+            cl = json.loads(subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True, timeout=2).stdout or "[]")
+            return {
+                "ok": True,
+                "backend": "hyprctl",
+                "active_id": aw.get("address"),
+                "active_title": aw.get("title"),
+                "active_class": aw.get("class"),
+                "cursor": {"x": cp.get("x"), "y": cp.get("y")} if "x" in cp else None,
+                "window_ids": [w.get("address") for w in cl if w.get("address")],
+            }
+        except Exception:
+            pass
+
+    # 3. Sway
+    if compositor == "sway" and "swaymsg" in tools:
+        try:
+            tree = json.loads(subprocess.run(["swaymsg", "-t", "get_tree", "-r"], capture_output=True, text=True, timeout=2).stdout)
+            active_info: Dict[str, Any] = {}
+            win_ids: List[str] = []
+
+            def walk(node: Dict[str, Any]) -> None:
+                if node.get("type") in ("con", "floating_con") and node.get("pid"):
+                    wid = str(node.get("id"))
+                    win_ids.append(wid)
+                    if node.get("focused"):
+                        active_info["id"] = wid
+                        active_info["title"] = node.get("name")
+                        active_info["class"] = node.get("app_id") or node.get("window_properties", {}).get("class")
+                for c in node.get("nodes", []) + node.get("floating_nodes", []):
+                    walk(c)
+
+            walk(tree)
+            return {
+                "ok": True,
+                "backend": "swaymsg",
+                "active_id": active_info.get("id"),
+                "active_title": active_info.get("title"),
+                "active_class": active_info.get("class"),
+                "cursor": None,
+                "window_ids": win_ids,
+            }
+        except Exception:
+            pass
+
+    # 4. X11 (xdotool)
+    if "xdotool" in tools:
+        try:
+            wid = subprocess.run(["xdotool", "getactivewindow"], capture_output=True, text=True, timeout=2).stdout.strip()
+            title = subprocess.run(["xdotool", "getwindowname", wid], capture_output=True, text=True, timeout=2).stdout.strip() if wid else None
+            mloc = subprocess.run(["xdotool", "getmouselocation", "--shell"], capture_output=True, text=True, timeout=2).stdout
+            cx = re.search(r"X=(\d+)", mloc)
+            cy = re.search(r"Y=(\d+)", mloc)
+            cursor = {"x": int(cx.group(1)), "y": int(cy.group(1))} if (cx and cy) else None
+            return {
+                "ok": True,
+                "backend": "xdotool",
+                "active_id": wid or None,
+                "active_title": title,
+                "active_class": None,
+                "cursor": cursor,
+                "window_ids": [],
+            }
+        except Exception:
+            pass
+
+    return {"ok": False, "backend": None, "active_id": None, "cursor": None, "window_ids": []}
+
+
+def focus_window(
+    window_id: Optional[str] = None,
+    query: Optional[str] = None,
+    class_name: Optional[str] = None,
+    unminimize: bool = True,
+) -> Dict[str, Any]:
+    """Explicitly focus/activate a window by ID, title substring, or class name."""
+    env = detect_environment()
+    compositor = env["compositor"]
+    tools = env["available_tools"]
+
+    # 1. KDE Plasma 6
+    if compositor == "kde-kwin" and env["runtime_dir_accessible"]:
+        return kwin_focus_window(
+            window_id=window_id, query=query, class_name=class_name, unminimize=unminimize
+        )
+
+    # 2. Hyprland
+    if compositor == "hyprland" and "hyprctl" in tools:
+        selector = None
+        if window_id:
+            selector = f"address:{window_id}"
+        elif class_name:
+            selector = f"class:{class_name}"
+        elif query:
+            selector = f"title:{query}"
+        if selector:
+            res = subprocess.run(["hyprctl", "dispatch", "focuswindow", selector], capture_output=True, text=True, timeout=3)
+            return {"ok": res.returncode == 0, "backend": "hyprctl", "selector": selector}
+
+    # 3. Sway
+    if compositor == "sway" and "swaymsg" in tools:
+        criteria = None
+        if window_id:
+            criteria = f"[con_id={window_id}]"
+        elif class_name:
+            criteria = f'[app_id="{class_name}"]'
+        elif query:
+            criteria = f'[title="(?i){query}"]'
+        if criteria:
+            res = subprocess.run(["swaymsg", f"{criteria} focus"], capture_output=True, text=True, timeout=3)
+            return {"ok": res.returncode == 0, "backend": "swaymsg", "criteria": criteria}
+
+    # 4. X11 (xdotool / wmctrl)
+    if "xdotool" in tools:
+        wid = window_id
+        if not wid and (query or class_name):
+            flag = "--class" if class_name else "--name"
+            pat = class_name or query or ""
+            sres = subprocess.run(["xdotool", "search", flag, pat], capture_output=True, text=True, timeout=3)
+            lines = [ln.strip() for ln in sres.stdout.splitlines() if ln.strip()]
+            wid = lines[0] if lines else None
+        if wid:
+            res = subprocess.run(["xdotool", "windowactivate", "--sync", str(wid)], capture_output=True, text=True, timeout=3)
+            return {"ok": res.returncode == 0, "backend": "xdotool", "id": wid}
+
+    if "wmctrl" in tools:
+        if window_id:
+            res = subprocess.run(["wmctrl", "-i", "-a", window_id], capture_output=True, text=True, timeout=3)
+            return {"ok": res.returncode == 0, "backend": "wmctrl", "id": window_id}
+        elif query:
+            res = subprocess.run(["wmctrl", "-a", query], capture_output=True, text=True, timeout=3)
+            return {"ok": res.returncode == 0, "backend": "wmctrl", "query": query}
+
+    return {"ok": False, "error": "No supported window focus backend available for this compositor."}
+
+
+def restore_focus_and_cursor(
+    snap: Optional[Dict[str, Any]],
+    restore_focus: bool = True,
+    restore_cursor: bool = True,
+    ui_controller: Optional[UInputController] = None,
+    screen_info: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Restore the user's previously active window and/or cursor position."""
+    restored = {"focus_restored": False, "cursor_restored": False}
+    if not snap or not snap.get("ok"):
+        return restored
+
+    if restore_cursor and snap.get("cursor") and snap["cursor"].get("x") is not None:
+        cx, cy = int(snap["cursor"]["x"]), int(snap["cursor"]["y"])
+        try:
+            if ui_controller is not None:
+                ui_controller.move_to(cx, cy)
+                restored["cursor_restored"] = True
+            else:
+                scr = screen_info or get_screen_info()
+                env = detect_environment()
+                if env["uinput_writable"]:
+                    with UInputController(scr["logical_width"], scr["logical_height"]) as ui:
+                        ui.move_to(cx, cy)
+                    restored["cursor_restored"] = True
+                elif "xdotool" in env["available_tools"]:
+                    subprocess.run(["xdotool", "mousemove", str(cx), str(cy)], capture_output=True, timeout=2)
+                    restored["cursor_restored"] = True
+        except Exception:
+            pass
+
+    if restore_focus and snap.get("active_id"):
+        # Brief settle so the compositor processes the click/focus event before we hand focus back
+        time.sleep(0.03)
+        fres = focus_window(window_id=snap["active_id"], unminimize=False)
+        restored["focus_restored"] = bool(fres.get("ok"))
+
+    return restored
+
+
+def _run_launch_focus_guard(prev_active_id: str, known_ids: List[str], duration: float = 2.5) -> None:
+    """
+    Background watcher invoked after `launch`/`open`: if a newly spawned window
+    steals focus from `prev_active_id`, immediately return focus to `prev_active_id`
+    without interfering if the user switches to an already-open window.
+    """
+    known_set = set(known_ids)
+    deadline = time.time() + duration
+    restored_count = 0
+    while time.time() < deadline:
+        time.sleep(0.12)
+        cur = get_focus_snapshot()
+        if not cur.get("ok"):
+            continue
+        cur_active = cur.get("active_id")
+        if cur_active and cur_active != prev_active_id and cur_active not in known_set:
+            focus_window(window_id=prev_active_id, unminimize=False)
+            restored_count += 1
+            known_set.add(cur_active)
+            if restored_count >= 2:
+                break
+
+
+# ---------------------------------------------------------------------------
+# AT-SPI2 Zero-Focus Background UI Interaction (GTK / Qt / Accessible Apps)
+# ---------------------------------------------------------------------------
+
+def _atspi_find_nodes(
+    app_query: Optional[str] = None,
+    name_query: Optional[str] = None,
+    role_query: Optional[str] = None,
+    max_depth: int = 12,
+) -> Dict[str, Any]:
+    """Inspect accessible applications and widgets via AT-SPI2 without touching focus."""
+    try:
+        import gi
+        gi.require_version("Atspi", "2.0")
+        from gi.repository import Atspi
+    except Exception as exc:
+        return {"ok": False, "error": f"AT-SPI2 Python bindings unavailable: {exc}"}
+
+    desktop = Atspi.get_desktop(0)
+    aq = (app_query or "").lower()
+    nq = (name_query or "").lower()
+    rq = (role_query or "").lower()
+    matches: List[Dict[str, Any]] = []
+    matched_objs: List[Any] = []
+
+    def walk(node: Any, app_name: str, depth: int) -> None:
+        if node is None or depth > max_depth:
+            return
+        try:
+            n_name = node.get_name() or ""
+            n_role = node.get_role_name() or ""
+        except Exception:
+            return
+
+        name_ok = (not nq) or (nq in n_name.lower())
+        role_ok = (not rq) or (rq in n_role.lower())
+        if name_ok and role_ok and (nq or rq or depth <= 2):
+            actions: List[str] = []
+            try:
+                ai = node.get_action_iface()
+                if ai:
+                    for idx in range(ai.get_n_actions()):
+                        actions.append(ai.get_action_name(idx))
+            except Exception:
+                pass
+            matches.append({
+                "app": app_name,
+                "name": n_name,
+                "role": n_role,
+                "actions": actions,
+            })
+            matched_objs.append(node)
+
+        try:
+            cnt = node.get_child_count()
+        except Exception:
+            cnt = 0
+        for i in range(min(cnt, 200)):
+            try:
+                child = node.get_child_at_index(i)
+                walk(child, app_name, depth + 1)
+            except Exception:
+                continue
+
+    for i in range(desktop.get_child_count()):
+        app = desktop.get_child_at_index(i)
+        if not app:
+            continue
+        aname = app.get_name() or ""
+        if aq and aq not in aname.lower():
+            continue
+        walk(app, aname, 0)
+
+    return {"ok": True, "matches": matches, "_objects": matched_objs}
+
+
+def a11y_click(app_query: str, name_query: str, role_query: Optional[str] = None) -> Dict[str, Any]:
+    """Invoke a button/widget action over AT-SPI2 completely in the background (zero focus change)."""
+    res = _atspi_find_nodes(app_query=app_query, name_query=name_query, role_query=role_query)
+    if not res.get("ok"):
+        return res
+    for meta, obj in zip(res["matches"], res["_objects"]):
+        ai = obj.get_action_iface()
+        if ai and ai.get_n_actions() > 0:
+            ok = bool(ai.do_action(0))
+            return {"ok": ok, "backend": "at-spi2", "zero_focus": True, "target": meta}
+    return {"ok": False, "backend": "at-spi2", "error": f"No actionable widget matching '{name_query}' in '{app_query}'"}
+
+
+def a11y_type(app_query: str, name_query: str, text: str) -> Dict[str, Any]:
+    """Set text in an editable widget over AT-SPI2 completely in the background (zero focus change)."""
+    res = _atspi_find_nodes(app_query=app_query, name_query=name_query)
+    if not res.get("ok"):
+        return res
+    for meta, obj in zip(res["matches"], res["_objects"]):
+        et = obj.get_editable_text_iface()
+        if et:
+            ok = bool(et.set_text_contents(text))
+            return {"ok": ok, "backend": "at-spi2", "zero_focus": True, "target": meta, "length": len(text)}
+    return {"ok": False, "backend": "at-spi2", "error": f"No editable text widget matching '{name_query}' in '{app_query}'"}
+
+
+# ---------------------------------------------------------------------------
 # High-Level Actions (Screenshots, Mouse, Keyboard, Windows, Clipboard)
 # ---------------------------------------------------------------------------
 
@@ -699,11 +1212,24 @@ def perform_click(
     count: int = 1,
     image_width: Optional[int] = None,
     image_height: Optional[int] = None,
+    preserve_focus: bool = True,
+    restore_cursor: bool = True,
+    window: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Move to (x, y) if provided and click mouse button."""
+    """
+    Move to (x, y) if provided and click mouse button.
+    By default (`preserve_focus=True`, `restore_cursor=True`), snapshots the user's
+    active window and cursor before clicking and immediately restores both afterward
+    so background app interaction does not steal focus from the user's work.
+    """
     env = detect_environment()
     screen = get_screen_info()
     tools = env["available_tools"]
+    snap = get_focus_snapshot() if (preserve_focus or restore_cursor) else None
+
+    if window:
+        focus_window(query=window)
+        time.sleep(0.06)
 
     # Prefer uinput (works universally on Wayland + X11 and even inside the sandbox!)
     if env["uinput_writable"]:
@@ -712,6 +1238,13 @@ def perform_click(
             if x is not None and y is not None:
                 target = ui.move_to(x, y, image_width=image_width, image_height=image_height)
             ui.click(button=button, count=count)
+            restored = restore_focus_and_cursor(
+                snap,
+                restore_focus=preserve_focus,
+                restore_cursor=restore_cursor,
+                ui_controller=ui,
+                screen_info=screen,
+            )
         return {
             "ok": True,
             "backend": "uinput",
@@ -719,6 +1252,7 @@ def perform_click(
             "y": target[1] if target else None,
             "button": button,
             "count": count,
+            **restored,
         }
 
     # Fallback to xdotool on X11
@@ -729,7 +1263,8 @@ def perform_click(
             cmd.extend(["mousemove", "--sync", str(x), str(y)])
         cmd.extend(["click", "--repeat", str(count), btn_num])
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-        return {"ok": res.returncode == 0, "backend": "xdotool", "stderr": res.stderr.strip()}
+        restored = restore_focus_and_cursor(snap, restore_focus=preserve_focus, restore_cursor=restore_cursor, screen_info=screen)
+        return {"ok": res.returncode == 0, "backend": "xdotool", "stderr": res.stderr.strip(), **restored}
 
     # Fallback to ydotool
     if "ydotool" in tools:
@@ -737,7 +1272,8 @@ def perform_click(
         if x is not None and y is not None:
             subprocess.run(["ydotool", "mousemove", "--absolute", "-x", str(x), "-y", str(y)], check=False)
         res = subprocess.run(["ydotool", "click", "--repeat", str(count), btn_hex], capture_output=True, text=True)
-        return {"ok": res.returncode == 0, "backend": "ydotool", "stderr": res.stderr.strip()}
+        restored = restore_focus_and_cursor(snap, restore_focus=preserve_focus, restore_cursor=restore_cursor, screen_info=screen)
+        return {"ok": res.returncode == 0, "backend": "ydotool", "stderr": res.stderr.strip(), **restored}
 
     return {
         "ok": False,
@@ -751,19 +1287,27 @@ def perform_move(
     relative: bool = False,
     image_width: Optional[int] = None,
     image_height: Optional[int] = None,
+    preserve_focus: bool = True,
 ) -> Dict[str, Any]:
     env = detect_environment()
     screen = get_screen_info()
     tools = env["available_tools"]
+    snap = get_focus_snapshot() if preserve_focus else None
 
     if env["uinput_writable"]:
         with UInputController(screen["logical_width"], screen["logical_height"]) as ui:
             if relative:
                 ui.move_rel(x, y)
-                return {"ok": True, "backend": "uinput", "relative": True, "dx": x, "dy": y}
+                res_dict: Dict[str, Any] = {"ok": True, "backend": "uinput", "relative": True, "dx": x, "dy": y}
             else:
                 cx, cy = ui.move_to(x, y, image_width=image_width, image_height=image_height)
-                return {"ok": True, "backend": "uinput", "relative": False, "x": cx, "y": cy}
+                res_dict = {"ok": True, "backend": "uinput", "relative": False, "x": cx, "y": cy}
+        if preserve_focus and snap and snap.get("active_id"):
+            cur = get_focus_snapshot()
+            if cur.get("active_id") and cur.get("active_id") != snap.get("active_id"):
+                focus_window(window_id=snap["active_id"], unminimize=False)
+                res_dict["focus_restored"] = True
+        return res_dict
 
     if env["session_type"] == "x11" and "xdotool" in tools:
         cmd = ["xdotool", "mousemove_relative" if relative else "mousemove", "--", str(x), str(y)]
@@ -780,9 +1324,12 @@ def perform_drag(
     duration: float = 0.35,
     image_width: Optional[int] = None,
     image_height: Optional[int] = None,
+    preserve_focus: bool = True,
+    restore_cursor: bool = True,
 ) -> Dict[str, Any]:
     env = detect_environment()
     screen = get_screen_info()
+    snap = get_focus_snapshot() if (preserve_focus or restore_cursor) else None
     if env["uinput_writable"]:
         with UInputController(screen["logical_width"], screen["logical_height"]) as ui:
             ui.drag(
@@ -790,12 +1337,20 @@ def perform_drag(
                 button=button, duration=duration,
                 image_width=image_width, image_height=image_height,
             )
+            restored = restore_focus_and_cursor(
+                snap,
+                restore_focus=preserve_focus,
+                restore_cursor=restore_cursor,
+                ui_controller=ui,
+                screen_info=screen,
+            )
         return {
             "ok": True,
             "backend": "uinput",
             "from": [start_x, start_y],
             "to": [end_x, end_y],
             "button": button,
+            **restored,
         }
     return {"ok": False, "error": "/dev/uinput is required for smooth drag operations."}
 
@@ -807,39 +1362,84 @@ def perform_scroll(
     y: Optional[int] = None,
     image_width: Optional[int] = None,
     image_height: Optional[int] = None,
+    preserve_focus: bool = True,
+    restore_cursor: bool = True,
 ) -> Dict[str, Any]:
     env = detect_environment()
     screen = get_screen_info()
+    snap = get_focus_snapshot() if (preserve_focus or restore_cursor) else None
     if env["uinput_writable"]:
         with UInputController(screen["logical_width"], screen["logical_height"]) as ui:
             if x is not None and y is not None:
                 ui.move_to(x, y, image_width=image_width, image_height=image_height)
             ui.scroll(dy=dy, dx=dx)
-        return {"ok": True, "backend": "uinput", "dy": dy, "dx": dx}
+            restored = restore_focus_and_cursor(
+                snap,
+                restore_focus=preserve_focus,
+                restore_cursor=restore_cursor,
+                ui_controller=ui,
+                screen_info=screen,
+            )
+        return {"ok": True, "backend": "uinput", "dy": dy, "dx": dx, **restored}
     return {"ok": False, "error": "No scroll backend available."}
 
 
-def perform_key(combo: str) -> Dict[str, Any]:
+def perform_key(
+    combo: str,
+    window: Optional[str] = None,
+    preserve_focus: bool = True,
+) -> Dict[str, Any]:
     env = detect_environment()
     screen = get_screen_info()
     tools = env["available_tools"]
+    snap = get_focus_snapshot() if (window and preserve_focus) else None
+
+    # On X11, xdotool can send keys directly to a background window without focusing it
+    if window and env["session_type"] == "x11" and "xdotool" in tools:
+        sres = subprocess.run(["xdotool", "search", "--name", window], capture_output=True, text=True, timeout=3)
+        wids = [ln.strip() for ln in sres.stdout.splitlines() if ln.strip()]
+        if wids:
+            res = subprocess.run(["xdotool", "key", "--window", wids[0], combo], capture_output=True, text=True)
+            if res.returncode == 0:
+                return {"ok": True, "backend": "xdotool-window", "zero_focus": True, "combo": combo, "window_id": wids[0]}
+
+    if window:
+        fres = focus_window(query=window)
+        if not fres.get("ok"):
+            return {"ok": False, "error": f"Could not target window '{window}': {fres.get('error')}"}
+        time.sleep(0.06)
 
     if env["uinput_writable"]:
         with UInputController(screen["logical_width"], screen["logical_height"]) as ui:
             ui.key_combo(combo)
-        return {"ok": True, "backend": "uinput", "combo": combo}
+        restored = restore_focus_and_cursor(snap, restore_focus=preserve_focus, restore_cursor=False, screen_info=screen) if snap else {}
+        return {"ok": True, "backend": "uinput", "combo": combo, **restored}
 
     if env["session_type"] == "x11" and "xdotool" in tools:
         res = subprocess.run(["xdotool", "key", combo], capture_output=True, text=True)
-        return {"ok": res.returncode == 0, "backend": "xdotool", "stderr": res.stderr.strip()}
+        restored = restore_focus_and_cursor(snap, restore_focus=preserve_focus, restore_cursor=False, screen_info=screen) if snap else {}
+        return {"ok": res.returncode == 0, "backend": "xdotool", "stderr": res.stderr.strip(), **restored}
 
     return {"ok": False, "error": "No key injection backend available."}
 
 
-def perform_type(text: str, paste: bool = False, enter: bool = False) -> Dict[str, Any]:
+def perform_type(
+    text: str,
+    paste: bool = False,
+    enter: bool = False,
+    window: Optional[str] = None,
+    preserve_focus: bool = True,
+) -> Dict[str, Any]:
     env = detect_environment()
     screen = get_screen_info()
     tools = env["available_tools"]
+    snap = get_focus_snapshot() if (window and preserve_focus) else None
+
+    if window:
+        fres = focus_window(query=window)
+        if not fres.get("ok"):
+            return {"ok": False, "error": f"Could not target window '{window}': {fres.get('error')}"}
+        time.sleep(0.06)
 
     # If text contains non-ASCII or user requested clipboard-paste mode, copy to clipboard and press Ctrl+V
     is_ascii = all(32 <= ord(c) < 127 or c in "\n\t" for c in text)
@@ -847,11 +1447,12 @@ def perform_type(text: str, paste: bool = False, enter: bool = False) -> Dict[st
         cb_res = clipboard_set(text)
         if cb_res.get("ok"):
             time.sleep(0.05)
-            key_res = perform_key("ctrl+v")
+            key_res = perform_key("ctrl+v", window=None, preserve_focus=False)
             if enter:
                 time.sleep(0.05)
-                perform_key("enter")
-            return {"ok": key_res.get("ok", False), "backend": "clipboard+ctrl+v", "length": len(text)}
+                perform_key("enter", window=None, preserve_focus=False)
+            restored = restore_focus_and_cursor(snap, restore_focus=preserve_focus, restore_cursor=False, screen_info=screen) if snap else {}
+            return {"ok": key_res.get("ok", False), "backend": "clipboard+ctrl+v", "length": len(text), **restored}
 
     if env["uinput_writable"]:
         with UInputController(screen["logical_width"], screen["logical_height"]) as ui:
@@ -859,19 +1460,22 @@ def perform_type(text: str, paste: bool = False, enter: bool = False) -> Dict[st
             if enter:
                 time.sleep(0.04)
                 ui.key_combo("enter")
-        return {"ok": True, "backend": "uinput", "length": len(text), "enter": enter}
+        restored = restore_focus_and_cursor(snap, restore_focus=preserve_focus, restore_cursor=False, screen_info=screen) if snap else {}
+        return {"ok": True, "backend": "uinput", "length": len(text), "enter": enter, **restored}
 
     if "wtype" in tools and env["session_type"] == "wayland":
         res = subprocess.run(["wtype", "--", text], capture_output=True, text=True)
         if enter:
             subprocess.run(["wtype", "-k", "Return"], check=False)
-        return {"ok": res.returncode == 0, "backend": "wtype"}
+        restored = restore_focus_and_cursor(snap, restore_focus=preserve_focus, restore_cursor=False, screen_info=screen) if snap else {}
+        return {"ok": res.returncode == 0, "backend": "wtype", **restored}
 
     if "xdotool" in tools and env["session_type"] == "x11":
         res = subprocess.run(["xdotool", "type", "--clearmodifiers", "--", text], capture_output=True, text=True)
         if enter:
             subprocess.run(["xdotool", "key", "Return"], check=False)
-        return {"ok": res.returncode == 0, "backend": "xdotool"}
+        restored = restore_focus_and_cursor(snap, restore_focus=preserve_focus, restore_cursor=False, screen_info=screen) if snap else {}
+        return {"ok": res.returncode == 0, "backend": "xdotool", **restored}
 
     return {"ok": False, "error": "No typing backend available."}
 
@@ -995,7 +1599,12 @@ def list_windows() -> Dict[str, Any]:
             walk(json.loads(res.stdout))
             return {"ok": True, "backend": "swaymsg", "windows": windows}
 
-    # 3. KDE KWin (queryWindowInfo or KWin supportInformation client list)
+    # 3. KDE KWin (KWin 6 Scripting first, fallback to supportInformation)
+    if compositor == "kde-kwin" and env["runtime_dir_accessible"]:
+        kstate = kwin_get_state()
+        if kstate and kstate.get("ok"):
+            return {"ok": True, "backend": "kwin-script", "windows": kstate.get("windows", [])}
+
     if compositor == "kde-kwin" and "qdbus6" in tools and env["runtime_dir_accessible"]:
         res = subprocess.run(
             ["qdbus6", "org.kde.KWin", "/KWin", "supportInformation"],
@@ -1052,9 +1661,21 @@ def list_windows() -> Dict[str, Any]:
     }
 
 
-def launch_app(command_or_target: str, is_url_or_file: bool = False) -> Dict[str, Any]:
-    """Launch a desktop application or open a URL/file detached from the terminal."""
+def launch_app(
+    command_or_target: str,
+    is_url_or_file: bool = False,
+    preserve_focus: bool = True,
+    guard_seconds: float = 2.5,
+) -> Dict[str, Any]:
+    """
+    Launch a desktop application or open a URL/file detached from the terminal.
+    When `preserve_focus=True` (default), spawns a lightweight background focus
+    guard that prevents the newly opened window from stealing focus from the
+    user's currently active window.
+    """
     ensure_desktop_env()
+    snap = get_focus_snapshot() if preserve_focus else None
+
     if is_url_or_file:
         cmd = ["xdg-open", command_or_target]
     else:
@@ -1067,7 +1688,29 @@ def launch_app(command_or_target: str, is_url_or_file: bool = False) -> Dict[str
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        return {"ok": True, "launched": command_or_target}
+        guard_started = False
+        if preserve_focus and snap and snap.get("ok") and snap.get("active_id"):
+            guard_cmd = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "_guard-focus",
+                "--active-id", str(snap["active_id"]),
+                "--known-ids", json.dumps(snap.get("window_ids", [])),
+                "--duration", str(guard_seconds),
+            ]
+            subprocess.Popen(
+                guard_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            guard_started = True
+        return {
+            "ok": True,
+            "launched": command_or_target,
+            "preserve_focus": preserve_focus,
+            "focus_guard_active": guard_started,
+        }
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -1079,7 +1722,7 @@ def launch_app(command_or_target: str, is_url_or_file: bool = False) -> Dict[str
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cu.py",
-        description="Universal Linux Computer Use CLI for Antigravity",
+        description="Universal Linux Computer Use CLI for Antigravity (focus-preserving by default)",
     )
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
@@ -1089,20 +1732,36 @@ def build_parser() -> argparse.ArgumentParser:
     # screen-info
     sub.add_parser("screen-info", help="Get logical and physical screen geometry and scaling")
 
+    # active-window
+    sub.add_parser("active-window", help="Get the currently focused window ID, title, and class")
+
+    # cursor-pos
+    sub.add_parser("cursor-pos", help="Get the current mouse cursor (x, y) coordinates")
+
+    # focus (explicit separate action)
+    p_focus = sub.add_parser("focus", help="Explicitly focus/activate a window (separate from interaction actions)")
+    p_focus.add_argument("query", nargs="?", help="Window title or class substring (case-insensitive)")
+    p_focus.add_argument("--id", dest="window_id", help="Exact window ID (from `cu.py windows`)")
+    p_focus.add_argument("--class", dest="class_name", help="Window class substring")
+    p_focus.add_argument("--no-unminimize", action="store_true", help="Do not unminimize minimized windows")
+
     # screenshot
-    p_ss = sub.add_parser("screenshot", help="Capture a screenshot of the desktop or active window")
+    p_ss = sub.add_parser("screenshot", help="Capture a screenshot of the desktop or active window (never steals focus)")
     p_ss.add_argument("-o", "--output", default="/tmp/agy_screenshot.png", help="Output PNG path")
     p_ss.add_argument("-w", "--window", action="store_true", help="Capture active window only")
     p_ss.add_argument("-g", "--region", help="Capture region 'X,Y WxH' (for grim/maim)")
 
     # click
-    p_click = sub.add_parser("click", help="Move to (x, y) and click a mouse button")
+    p_click = sub.add_parser("click", help="Click at (x, y) while preserving user focus and cursor by default")
     p_click.add_argument("x", type=int, nargs="?", help="X coordinate")
     p_click.add_argument("y", type=int, nargs="?", help="Y coordinate")
     p_click.add_argument("-b", "--button", default="left", choices=["left", "right", "middle"], help="Mouse button")
     p_click.add_argument("-c", "--count", type=int, default=1, help="Click count (2 for double-click)")
     p_click.add_argument("--image-width", type=int, help="Source screenshot width (auto-scales HiDPI coordinates)")
     p_click.add_argument("--image-height", type=int, help="Source screenshot height (auto-scales HiDPI coordinates)")
+    p_click.add_argument("--window", help="Optional target window title/class (restores user focus afterward)")
+    p_click.add_argument("--steal-focus", action="store_true", help="Allow click to leave focus on the clicked window")
+    p_click.add_argument("--keep-cursor", action="store_true", help="Leave cursor at target instead of restoring it")
 
     # move
     p_move = sub.add_parser("move", help="Move mouse pointer to (x, y) or by relative offset")
@@ -1111,9 +1770,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_move.add_argument("-r", "--relative", action="store_true", help="Relative movement")
     p_move.add_argument("--image-width", type=int, help="Source screenshot width")
     p_move.add_argument("--image-height", type=int, help="Source screenshot height")
+    p_move.add_argument("--steal-focus", action="store_true", help="Allow focus-follows-mouse to change focus")
 
     # drag
-    p_drag = sub.add_parser("drag", help="Drag mouse from (start_x, start_y) to (end_x, end_y)")
+    p_drag = sub.add_parser("drag", help="Drag from (start_x, start_y) to (end_x, end_y) preserving user focus by default")
     p_drag.add_argument("start_x", type=int)
     p_drag.add_argument("start_y", type=int)
     p_drag.add_argument("end_x", type=int)
@@ -1122,25 +1782,49 @@ def build_parser() -> argparse.ArgumentParser:
     p_drag.add_argument("-d", "--duration", type=float, default=0.35, help="Drag duration in seconds")
     p_drag.add_argument("--image-width", type=int, help="Source screenshot width")
     p_drag.add_argument("--image-height", type=int, help="Source screenshot height")
+    p_drag.add_argument("--steal-focus", action="store_true", help="Allow drag to leave focus on the target window")
+    p_drag.add_argument("--keep-cursor", action="store_true", help="Leave cursor at end position instead of restoring it")
 
     # scroll
-    p_scroll = sub.add_parser("scroll", help="Scroll mouse wheel (dy > 0 up, dy < 0 down)")
+    p_scroll = sub.add_parser("scroll", help="Scroll mouse wheel preserving user focus and cursor by default")
     p_scroll.add_argument("dy", type=int, help="Vertical scroll clicks (positive=up, negative=down)")
     p_scroll.add_argument("--dx", type=int, default=0, help="Horizontal scroll clicks")
     p_scroll.add_argument("-x", type=int, help="Optional X coordinate to move pointer to before scrolling")
     p_scroll.add_argument("-y", type=int, help="Optional Y coordinate to move pointer to before scrolling")
     p_scroll.add_argument("--image-width", type=int, help="Source screenshot width")
     p_scroll.add_argument("--image-height", type=int, help="Source screenshot height")
+    p_scroll.add_argument("--steal-focus", action="store_true", help="Allow scroll to change active window focus")
+    p_scroll.add_argument("--keep-cursor", action="store_true", help="Leave cursor at scroll position")
 
     # key
-    p_key = sub.add_parser("key", help="Press a key or shortcut combo (e.g. 'ctrl+c', 'alt+tab', 'super', 'enter')")
+    p_key = sub.add_parser("key", help="Press a key or shortcut combo (use --window to target without stealing focus)")
     p_key.add_argument("combo", help="Key combination joined by '+'")
+    p_key.add_argument("--window", help="Target window title/class; restores user focus immediately afterward")
+    p_key.add_argument("--steal-focus", action="store_true", help="Leave focus on --window after sending keys")
 
     # type
-    p_type = sub.add_parser("type", help="Type text string via keyboard or clipboard paste")
+    p_type = sub.add_parser("type", help="Type text string (use --window to target without stealing focus)")
     p_type.add_argument("text", help="Text string to type")
     p_type.add_argument("--paste", action="store_true", help="Copy to clipboard and press Ctrl+V (fast & Unicode-safe)")
     p_type.add_argument("--enter", action="store_true", help="Press Enter after typing")
+    p_type.add_argument("--window", help="Target window title/class; restores user focus immediately afterward")
+    p_type.add_argument("--steal-focus", action="store_true", help="Leave focus on --window after typing")
+
+    # a11y-list / a11y-click / a11y-type (zero-focus AT-SPI2)
+    p_a11y_list = sub.add_parser("a11y-list", help="List accessible apps/widgets via AT-SPI2 (zero focus impact)")
+    p_a11y_list.add_argument("--app", help="Filter by app name substring")
+    p_a11y_list.add_argument("--name", help="Filter by widget name substring")
+    p_a11y_list.add_argument("--role", help="Filter by widget role substring")
+
+    p_a11y_click = sub.add_parser("a11y-click", help="Click a widget in a background app via AT-SPI2 (zero focus/cursor impact)")
+    p_a11y_click.add_argument("app", help="Application name substring")
+    p_a11y_click.add_argument("name", help="Widget/button name substring")
+    p_a11y_click.add_argument("--role", help="Optional widget role filter")
+
+    p_a11y_type = sub.add_parser("a11y-type", help="Set text in a background app widget via AT-SPI2 (zero focus impact)")
+    p_a11y_type.add_argument("app", help="Application name substring")
+    p_a11y_type.add_argument("name", help="Editable widget name substring")
+    p_a11y_type.add_argument("text", help="Text content to set")
 
     # clipboard-get
     sub.add_parser("clipboard-get", help="Read current system clipboard contents")
@@ -1153,12 +1837,22 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("windows", help="List open desktop windows and their titles/geometry")
 
     # launch
-    p_launch = sub.add_parser("launch", help="Launch a desktop application in the background")
+    p_launch = sub.add_parser("launch", help="Launch a desktop application without stealing user focus by default")
     p_launch.add_argument("command", help="Application binary or command string")
+    p_launch.add_argument("--steal-focus", action="store_true", help="Allow the newly launched app to take focus")
+    p_launch.add_argument("--guard-seconds", type=float, default=2.5, help="Seconds to guard user focus after launch")
 
     # open
-    p_open = sub.add_parser("open", help="Open a file or URL with xdg-open")
+    p_open = sub.add_parser("open", help="Open a file or URL with xdg-open without stealing user focus by default")
     p_open.add_argument("target", help="File path or URL")
+    p_open.add_argument("--steal-focus", action="store_true", help="Allow the opened app to take focus")
+    p_open.add_argument("--guard-seconds", type=float, default=2.5, help="Seconds to guard user focus after open")
+
+    # internal background focus guard
+    p_guard = sub.add_parser("_guard-focus", help=argparse.SUPPRESS)
+    p_guard.add_argument("--active-id", required=True)
+    p_guard.add_argument("--known-ids", default="[]")
+    p_guard.add_argument("--duration", type=float, default=2.5)
 
     return parser
 
@@ -1167,12 +1861,57 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
+    if args.subcommand == "_guard-focus":
+        try:
+            known = json.loads(args.known_ids)
+        except Exception:
+            known = []
+        _run_launch_focus_guard(args.active_id, known, duration=args.duration)
+        return 0
+
     if args.subcommand == "doctor":
         env = detect_environment()
         screen = get_screen_info()
-        result = {"ok": True, "environment": env, "screen": screen}
+        snap = get_focus_snapshot()
+        result = {
+            "ok": True,
+            "environment": env,
+            "screen": screen,
+            "focus_control": {
+                "supported": bool(snap.get("ok")),
+                "backend": snap.get("backend"),
+                "active_window": snap.get("active_title"),
+                "cursor": snap.get("cursor"),
+            },
+        }
     elif args.subcommand == "screen-info":
         result = {"ok": True, **get_screen_info()}
+    elif args.subcommand == "active-window":
+        snap = get_focus_snapshot()
+        result = {
+            "ok": bool(snap.get("ok")),
+            "backend": snap.get("backend"),
+            "id": snap.get("active_id"),
+            "title": snap.get("active_title"),
+            "class": snap.get("active_class"),
+        }
+    elif args.subcommand == "cursor-pos":
+        snap = get_focus_snapshot()
+        result = {
+            "ok": bool(snap.get("ok") and snap.get("cursor")),
+            "backend": snap.get("backend"),
+            "cursor": snap.get("cursor"),
+        }
+    elif args.subcommand == "focus":
+        if not (args.window_id or args.query or args.class_name):
+            result = {"ok": False, "error": "Provide a window title query, --id, or --class to focus."}
+        else:
+            result = focus_window(
+                window_id=args.window_id,
+                query=args.query,
+                class_name=args.class_name,
+                unminimize=not args.no_unminimize,
+            )
     elif args.subcommand == "screenshot":
         result = take_screenshot(args.output, window_only=args.window, region=args.region)
     elif args.subcommand == "click":
@@ -1180,28 +1919,52 @@ def main() -> int:
             args.x, args.y,
             button=args.button, count=args.count,
             image_width=args.image_width, image_height=args.image_height,
+            preserve_focus=not args.steal_focus,
+            restore_cursor=not args.keep_cursor,
+            window=args.window,
         )
     elif args.subcommand == "move":
         result = perform_move(
             args.x, args.y,
             relative=args.relative,
             image_width=args.image_width, image_height=args.image_height,
+            preserve_focus=not args.steal_focus,
         )
     elif args.subcommand == "drag":
         result = perform_drag(
             args.start_x, args.start_y, args.end_x, args.end_y,
             button=args.button, duration=args.duration,
             image_width=args.image_width, image_height=args.image_height,
+            preserve_focus=not args.steal_focus,
+            restore_cursor=not args.keep_cursor,
         )
     elif args.subcommand == "scroll":
         result = perform_scroll(
             dy=args.dy, dx=args.dx, x=args.x, y=args.y,
             image_width=args.image_width, image_height=args.image_height,
+            preserve_focus=not args.steal_focus,
+            restore_cursor=not args.keep_cursor,
         )
     elif args.subcommand == "key":
-        result = perform_key(args.combo)
+        result = perform_key(
+            args.combo,
+            window=args.window,
+            preserve_focus=not args.steal_focus,
+        )
     elif args.subcommand == "type":
-        result = perform_type(args.text, paste=args.paste, enter=args.enter)
+        result = perform_type(
+            args.text,
+            paste=args.paste, enter=args.enter,
+            window=args.window,
+            preserve_focus=not args.steal_focus,
+        )
+    elif args.subcommand == "a11y-list":
+        raw = _atspi_find_nodes(app_query=args.app, name_query=args.name, role_query=args.role)
+        result = {"ok": raw.get("ok", False), "matches": raw.get("matches", []), **({"error": raw["error"]} if "error" in raw else {})}
+    elif args.subcommand == "a11y-click":
+        result = a11y_click(args.app, args.name, role_query=args.role)
+    elif args.subcommand == "a11y-type":
+        result = a11y_type(args.app, args.name, args.text)
     elif args.subcommand == "clipboard-get":
         result = clipboard_get()
     elif args.subcommand == "clipboard-set":
@@ -1209,9 +1972,17 @@ def main() -> int:
     elif args.subcommand == "windows":
         result = list_windows()
     elif args.subcommand == "launch":
-        result = launch_app(args.command, is_url_or_file=False)
+        result = launch_app(
+            args.command, is_url_or_file=False,
+            preserve_focus=not args.steal_focus,
+            guard_seconds=args.guard_seconds,
+        )
     elif args.subcommand == "open":
-        result = launch_app(args.target, is_url_or_file=True)
+        result = launch_app(
+            args.target, is_url_or_file=True,
+            preserve_focus=not args.steal_focus,
+            guard_seconds=args.guard_seconds,
+        )
     else:
         result = {"ok": False, "error": f"Unknown subcommand: {args.subcommand}"}
 

@@ -14,9 +14,11 @@ description: >-
 This skill equips Antigravity with full graphical desktop control on Linux across both **Wayland** (KDE Plasma/KWin, GNOME/Mutter, Hyprland, Sway/wlroots) and **X11**.
 
 > [!IMPORTANT]
-> **When to use `browser` subagent vs. `computer-use` skill:**
-> - For standard web browsing or web application tasks, prefer the built-in `browser` subagent.
-> - Use this **`computer-use`** skill whenever you need to interact with **native Linux desktop applications**, OS dialogs, terminal emulators, IDE windows, system trays, file managers, or any desktop GUI outside the built-in webview.
+> **Non-Focus-Stealing Policy (Default Behavior):**
+> - **All interaction actions (`click`, `drag`, `scroll`, `launch`, `open`, and `--window`-targeted `key`/`type`) preserve the user's currently focused window and cursor position by default.**
+> - **Focusing an application is a separate, explicit action (`cu.py focus <query>`).** Do NOT call `cu.py focus` or pass `--steal-focus` unless the user explicitly asks you to switch to or bring an application into focus.
+> - When an app exposes accessibility widgets (GTK/Qt/accessible apps), prefer `cu.py a11y-click` / `cu.py a11y-type` for 100% zero-focus, zero-cursor-movement interaction.
+> - For standard web browsing or web application tasks, prefer the built-in `browser` subagent. Use **`computer-use`** for native Linux desktop applications and GUI workflows.
 
 ---
 
@@ -91,7 +93,7 @@ Use **either or both** of these grounding strategies before clicking:
 > **HiDPI / Fractional Scaling Auto-Normalization**:
 > Always pass `--image-width <W> --image-height <H>` (using the `image_width` and `image_height` returned by `cu.py screenshot`) when clicking or moving to coordinates measured from a screenshot or OCR! `cu.py` automatically normalizes screenshot pixel coordinates into the kernel's `0..32767` uinput space, preventing HiDPI scaling mismatches.
 
-- **Left / Right / Double Click**:
+- **Left / Right / Double Click** *(preserves user's active window and cursor position by default; pass `--steal-focus` or `--keep-cursor` only if explicitly requested)*:
   ```bash
   python3 ~/.gemini/config/skills/computer-use/scripts/cu.py click 640 420 --image-width 1920 --image-height 1080
   python3 ~/.gemini/config/skills/computer-use/scripts/cu.py click 640 420 -b right --image-width 1920 --image-height 1080
@@ -102,34 +104,42 @@ Use **either or both** of these grounding strategies before clicking:
   python3 ~/.gemini/config/skills/computer-use/scripts/cu.py move 800 500 --image-width 1920 --image-height 1080
   python3 ~/.gemini/config/skills/computer-use/scripts/cu.py move 50 -30 --relative
   ```
-- **Drag and Drop**:
+- **Drag and Drop** *(preserves focus & cursor by default)*:
   ```bash
   python3 ~/.gemini/config/skills/computer-use/scripts/cu.py drag 300 400 900 400 --duration 0.4 --image-width 1920 --image-height 1080
   ```
-- **Scroll Wheel** (`dy > 0` scrolls UP, `dy < 0` scrolls DOWN):
+- **Scroll Wheel** (`dy > 0` scrolls UP, `dy < 0` scrolls DOWN; preserves focus & cursor by default):
   ```bash
   python3 ~/.gemini/config/skills/computer-use/scripts/cu.py scroll -5 -x 640 -y 500 --image-width 1920 --image-height 1080
   ```
-- **Type Text** (use `--paste` for instant Unicode/long-text entry via clipboard + `Ctrl+V`, and `--enter` to submit):
+- **Type Text & Keyboard Shortcuts** *(use `--window "<title/class>"` to target a background app and automatically restore user focus immediately afterward)*:
   ```bash
-  python3 ~/.gemini/config/skills/computer-use/scripts/cu.py type "Hello world!" --enter
+  python3 ~/.gemini/config/skills/computer-use/scripts/cu.py type "Hello world!" --window "Discord" --enter
   python3 ~/.gemini/config/skills/computer-use/scripts/cu.py type "Fast or Unicode text: 🚀" --paste --enter
+  python3 ~/.gemini/config/skills/computer-use/scripts/cu.py key "ctrl+l" --window "LibreWolf"
   ```
-- **Press Keyboard Shortcuts / Combos**:
+- **Zero-Focus Background Interaction via AT-SPI2** *(zero focus or cursor change for accessible GTK/Qt apps)*:
   ```bash
-  python3 ~/.gemini/config/skills/computer-use/scripts/cu.py key "ctrl+l"
-  python3 ~/.gemini/config/skills/computer-use/scripts/cu.py key "ctrl+shift+t"
-  python3 ~/.gemini/config/skills/computer-use/scripts/cu.py key "alt+f4"
-  python3 ~/.gemini/config/skills/computer-use/scripts/cu.py key "super"
+  python3 ~/.gemini/config/skills/computer-use/scripts/cu.py a11y-list --app "easyeffects"
+  python3 ~/.gemini/config/skills/computer-use/scripts/cu.py a11y-click "easyeffects" "Bypass"
+  python3 ~/.gemini/config/skills/computer-use/scripts/cu.py a11y-type "gedit" "Search" "query"
   ```
-- **Launch Applications or Open Files/URLs**:
+- **Explicit App Focusing (Separate Action — Only When Requested)**:
+  ```bash
+  python3 ~/.gemini/config/skills/computer-use/scripts/cu.py focus "Dolphin"
+  python3 ~/.gemini/config/skills/computer-use/scripts/cu.py focus --class "discord"
+  python3 ~/.gemini/config/skills/computer-use/scripts/cu.py focus --id "{eb5999c2-b773-4695-99d0-6330ee463e22}"
+  ```
+- **Launch Applications or Open Files/URLs** *(guards against focus-stealing for 2.5s by default so the new app does not interrupt the user's active window; pass `--steal-focus` only if asked to switch to it)*:
   ```bash
   python3 ~/.gemini/config/skills/computer-use/scripts/cu.py launch "konsole"
   python3 ~/.gemini/config/skills/computer-use/scripts/cu.py open "/home/kirbo/Desktop"
   ```
-- **List Open Windows & Read/Write Clipboard**:
+- **Inspect Windows, Active Focus, Cursor, & Clipboard**:
   ```bash
   python3 ~/.gemini/config/skills/computer-use/scripts/cu.py windows
+  python3 ~/.gemini/config/skills/computer-use/scripts/cu.py active-window
+  python3 ~/.gemini/config/skills/computer-use/scripts/cu.py cursor-pos
   python3 ~/.gemini/config/skills/computer-use/scripts/cu.py clipboard-get
   python3 ~/.gemini/config/skills/computer-use/scripts/cu.py clipboard-set "copied text"
   ```
